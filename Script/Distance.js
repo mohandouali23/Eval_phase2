@@ -47,7 +47,7 @@ const R =6371*1000; // rayon de la terre en m
 
 function main(){
 
-    const{execFile,SheetName,data} =loadFileExcel("../eval2.xlsx");
+    const{execFile,SheetName,data} =loadFileExcel("../Book1.xlsx");
 
     //trie pour garantir l ordre
     data.sort((a, b) => {
@@ -84,5 +84,6 @@ function main(){
 }
 
 main();
+
 
 
