@@ -1,102 +1,127 @@
-const xlsx = require("xlsx");
-const { Worker } = require("worker_threads");
-const os = require("os");
+const xlsx = require('xlsx');
+const axios = require('axios');
 
-function loadExcel(file) {
-    const wb = xlsx.readFile(file);
-    const sheet = wb.Sheets[wb.SheetNames[0]];
-    return { wb, sheetName: wb.SheetNames[0], data: xlsx.utils.sheet_to_json(sheet, { defval: "" }) };
+const OSRM_BASE = 'https://router.project-osrm.org';
+
+function loadFileExcel(file) {
+  const execFile = xlsx.readFile(file);
+  const SheetName = execFile.SheetNames[0];
+  const sheet = execFile.Sheets[SheetName];
+  const data = xlsx.utils.sheet_to_json(sheet, { defval: '' });
+
+  return { execFile, SheetName, data };
 }
 
-function chunk(arr, size) {
-    const out = [];
-    for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-    return out;
+function osrmRouteUrl(lonA, latA, lonB, latB, profile = 'driving') {
+  return `${OSRM_BASE}/route/v1/${profile}/${lonA},${latA};${lonB},${latB}?overview=false`;
 }
 
-function runWorker(id, coords) {
-    return new Promise((resolve) => {
-        const worker = new Worker("./workers/matrixWorker.js", { workerData: { id, coords } });
-        worker.on("message", resolve);
-        worker.on("error", err => resolve({ id, error: err.message }));
-    });
+function sleep(ms) {
+  return new Promise(res => setTimeout(res, ms));
 }
 
-async function runWorkersInPool(chunks, maxParallel) {
-    let index = 0;
-    let results = [];
+async function getDistanceOSRM(lonA, latA, lonB, latB) {
 
-    async function launchNext() {
-        if (index >= chunks.length) return;
+  if (![latA, lonA, latB, lonB].every(v =>
+    v !== null && v !== undefined && v !== '' && !Number.isNaN(Number(v)))) {
+    return 0;
+  }
 
-        let currentIndex = index;
-        index++;
+  const url = osrmRouteUrl(lonA, latA, lonB, latB);
 
-        const res = await runWorker(currentIndex, chunks[currentIndex]);
-        results[currentIndex] = res;
-
-        await launchNext();
+  try {
+    const res = await axios.get(url, { timeout: 10000 });
+    if (res.data?.routes?.length > 0) {
+      return res.data.routes[0].distance;  // en mètres
+    } else {
+      console.warn("Pas de route trouvée.");
+      return 0;
     }
-
-    let pool = [];
-    for (let i = 0; i < Math.min(maxParallel, chunks.length); i++) {
-        pool.push(launchNext());
-    }
-
-    await Promise.all(pool);
-    return results;
+  } catch (err) {
+    console.error("Erreur OSRM:", err.message || err);
+    return 0;
+  }
 }
+function extractUniqueSegments(data) {
+  const trips = {};
+  const segmentMap = new Map();
 
+  // Regrouper par trip
+  data.forEach(r => {
+    if (!trips[r.trip_id]) trips[r.trip_id] = [];
+    trips[r.trip_id].push(r);
+  });
+
+  // Trier et générer segments
+  Object.keys(trips).forEach(tripId => {
+    const rows = trips[tripId].sort((a, b) => a.stop_sequence - b.stop_sequence);
+
+    for (let i = 0; i < rows.length - 1; i++) {
+      const r1 = rows[i];
+      const r2 = rows[i + 1];
+
+      const key = `${r1.stop_id}-${r2.stop_id}`;
+      if (!segmentMap.has(key)) {
+        segmentMap.set(key, {
+          from_stop: r1.stop_id,
+          to_stop: r2.stop_id,
+          lonA: r1.arret_lon,
+          latA: r1.arret_lat,
+          lonB: r2.arret_lon,
+          latB: r2.arret_lat
+        });
+      }
+    }
+  });
+  console.log(`Segments uniques trouvés : ${segmentMap.size}`);
+
+  return Array.from(segmentMap.values());
+}
 async function main() {
-    const { wb, sheetName, data } = loadExcel("../eval2.xlsx");
 
-    data.sort((a, b) =>
-        Number(a.trip_id) - Number(b.trip_id) ||
-        Number(a.stop_sequence) - Number(b.stop_sequence)
-    );
+  console.time("Durée totale");
 
-    const coords = data.map(r => ({ lat: Number(r.arret_lat), lon: Number(r.arret_lon) }));
+  const { execFile, SheetName, data } = loadFileExcel('../eval2.xlsx');
+  const segments = extractUniqueSegments(data);
+  const distanceMap = new Map();
 
-    const maxChunkSize = 100;
-    const cpuCount = Math.max(os.cpus().length - 1, 1);
-    const maxParallelWorkers = Math.min(cpuCount, 5); // Limite pour éviter 429
+  // Calculer distance de chaque segment unique
+  for (let i = 0; i < segments.length; i++) {
+    const s = segments[i];
+    console.log(`Segment ${i + 1}/${segments.length} → ${s.from_stop} → ${s.to_stop}`);
 
-    const coordChunks = chunk(coords, maxChunkSize);
-    console.log(` Total chunks = ${coordChunks.length}`);
-    console.log(`⚙️ Threads CPU: ${cpuCount}, Max parallel OSRM calls: ${maxParallelWorkers}`);
+    const dist = await getDistanceOSRM(s.lonA, s.latA, s.lonB, s.latB);
+    distanceMap.set(`${s.from_stop}-${s.to_stop}`, dist);
 
-    console.log("🚀 Lancement en pool contrôlé...");
-    const results = await runWorkersInPool(coordChunks, maxParallelWorkers);
+    await sleep(50);
+  }
 
-    let fullMatrices = [];
-    for (const res of results) {
-        if (res.error) {
-            console.error(`❌ Erreur worker #${res.id}: ${res.error}`);
-            return;
-        }
-        fullMatrices.push({ index: res.id, distances: res.distances });
+  data.sort((a, b) => {
+    const t = (Number(a.trip_id) || 0) - (Number(b.trip_id) || 0);
+    if (t !== 0) return t;
+    return (Number(a.stop_sequence) || 0) - (Number(b.stop_sequence) || 0);
+  });
+
+  let lastTrip = null;
+
+  for (let i = 0; i < data.length; i++) {
+    const row = data[i];
+
+    if (row.trip_id !== lastTrip) {  // Première ligne du trip
+      row.distance = 0;
+      lastTrip = row.trip_id;
+    } else {  // Ligne suivante same trip
+      const prev = data[i - 1];
+      const key = `${prev.stop_id}-${row.stop_id}`;
+      row.distance = Number(distanceMap.get(key) || 0).toFixed(2);
     }
+  }
+  const newSheet = xlsx.utils.json_to_sheet(data);
+  execFile.Sheets[SheetName] = newSheet;
+  xlsx.writeFile(execFile, 'resultat_distanceoutput.xlsx');
 
-    for (let i = 0; i < data.length; i++) {
-        const cur = data[i];
-        const prev = data[i - 1];
-        let dist = 0;
-
-        if (prev && prev.trip_id === cur.trip_id) {
-            let chunkId = Math.floor((i - 1) / maxChunkSize);
-            let localPrev = (i - 1) % maxChunkSize;
-            let localCur = i % maxChunkSize;
-            dist = fullMatrices[chunkId].distances[localPrev][localCur];
-        }
-
-        cur.distance = Number(dist || 0).toFixed(2);
-    }
-
-    const newSheet = xlsx.utils.json_to_sheet(data);
-    wb.Sheets[sheetName] = newSheet;
-    xlsx.writeFile(wb, "resultat_matrix_multithread.xlsx");
-
-    console.log("\n🎉 Terminé sans erreur 429 !");
+  console.timeEnd("Durée totale");
 }
+main().catch(err => console.error(err)); 
 
-main();
+
